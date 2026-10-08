@@ -1,0 +1,120 @@
+name: GitHub Release (no npm publish)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (defaults to v<drizzle-orm version>)'
+        required: false
+        type: string
+      draft:
+        description: 'Create as a draft release'
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: 'Mark as a prerelease'
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: github-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v6
+        with:
+          run_install: false
+
+      # Deliberately omit registry-url and all npm credentials. This workflow must
+      # only build a tarball and upload it as a GitHub Release asset.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Build drizzle-orm
+        run: pnpm build:orm
+
+      - name: Pack drizzle-orm
+        working-directory: drizzle-orm
+        run: pnpm run pack
+
+      - name: Prepare release metadata
+        id: release
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          version="$(jq -r .version drizzle-orm/package.json)"
+          tag="${REQUESTED_TAG:-v$version}"
+          asset="drizzle-orm-${version}-dist.tgz"
+          changelog="changelogs/drizzle-orm/${version}.md"
+
+          if [[ ! -f "$changelog" ]]; then
+            echo "::error::Changelog not found: $changelog"
+            exit 1
+          fi
+
+          mv drizzle-orm/package.tgz "$asset"
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "asset=$asset"
+            echo "changelog=$changelog"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ensure release does not already exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::GitHub Release $TAG already exists"
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          ASSET: ${{ steps.release.outputs.asset }}
+          CHANGELOG: ${{ steps.release.outputs.changelog }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          args=(
+            "$TAG"
+            "$ASSET"
+            --repo "$GITHUB_REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "$VERSION"
+            --notes-file "$CHANGELOG"
+          )
+          [[ "$DRAFT" == "true" ]] && args+=(--draft)
+          [[ "$PRERELEASE" == "true" ]] && args+=(--prerelease)
+
+          gh release create "${args[@]}"
