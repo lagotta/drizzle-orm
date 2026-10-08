@@ -1,0 +1,155 @@
+name: GitHub Release (no npm publish)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (defaults to <package version>-<short commit>)'
+        required: false
+        type: string
+      draft:
+        description: 'Create as a draft release'
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: 'Mark as a prerelease'
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: github-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v6
+        with:
+          run_install: false
+
+      # Deliberately omit registry-url and all npm credentials. This workflow must
+      # only build a tarball and upload it as a GitHub Release asset.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Build release packages
+        run: pnpm build:artifact
+
+      - name: Pack release packages
+        run: pnpm pack:artifact
+
+      - name: Prepare release metadata and assets
+        id: release
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          packages=(drizzle-orm drizzle-kit drizzle-seed)
+          base_version="$(jq -r .version drizzle-orm/package.json)"
+          suffix="$(git rev-parse --short HEAD)"
+          version="$base_version-$suffix"
+          tag="${REQUESTED_TAG:-$version}"
+          notes="release-notes.md"
+
+          {
+            echo "# $version"
+            echo
+            echo "Custom build from commit \`$GITHUB_SHA\`."
+          } > "$notes"
+
+          for package in "${packages[@]}"; do
+            package_version="$(jq -r .version "$package/package.json")"
+            if [[ "$package_version" != "$base_version" ]]; then
+              echo "::error::$package has version $package_version; expected $base_version"
+              exit 1
+            fi
+
+            changelog="changelogs/$package/$base_version.md"
+            if [[ ! -f "$changelog" ]]; then
+              echo "::error::Changelog not found: $changelog"
+              exit 1
+            fi
+
+            tmpdir="$(mktemp -d)"
+            tar -xzf "$package/package.tgz" -C "$tmpdir"
+            jq --arg version "$version" '.version = $version' \
+              "$tmpdir/package/package.json" > "$tmpdir/package/package.json.tmp"
+            mv "$tmpdir/package/package.json.tmp" "$tmpdir/package/package.json"
+
+            asset="$package-$version-dist.tgz"
+            tar -czf "$asset" -C "$tmpdir" package
+            rm -rf "$tmpdir"
+
+            {
+              echo
+              echo "## $package"
+              echo
+              tail -n +2 "$changelog"
+            } >> "$notes"
+          done
+
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "notes=$notes"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ensure release does not already exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::GitHub Release $TAG already exists"
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          NOTES: ${{ steps.release.outputs.notes }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          assets=(
+            drizzle-orm-*-dist.tgz
+            drizzle-kit-*-dist.tgz
+            drizzle-seed-*-dist.tgz
+          )
+          args=(
+            "$TAG"
+            "${assets[@]}"
+            --repo "$GITHUB_REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "$VERSION"
+            --notes-file "$NOTES"
+          )
+          [[ "$DRAFT" == "true" ]] && args+=(--draft)
+          [[ "$PRERELEASE" == "true" ]] && args+=(--prerelease)
+
+          gh release create "${args[@]}"

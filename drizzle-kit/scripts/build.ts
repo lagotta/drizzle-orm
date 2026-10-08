@@ -10,6 +10,8 @@ const driversPackages = [
 	// postgres drivers
 	'pg',
 	'postgres',
+	'@aws/aurora-dsql-node-postgres-connector',
+	'@aws/aurora-dsql-postgresjs-connector',
 	'@vercel/postgres',
 	'@neondatabase/serverless',
 	'@electric-sql/pglite',
